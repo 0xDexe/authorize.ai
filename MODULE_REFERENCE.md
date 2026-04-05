@@ -9,14 +9,19 @@
 ```
 authorizeai/
 ├── app.py                          # Streamlit demo entry point
-├── train_model.py                  # CLI script to train the prediction model
+├── train_model.py                  # CLI script to train prediction model (synthetic data)
+├── setup_data.py                   # CLI for MIMIC setup, eval, and MIMIC-based training
 ├── requirements.txt                # Python dependencies
 ├── .env.example                    # Environment variable template
 ├── data/
 │   ├── policies/                   # Raw policy documents (.txt, .json)
 │   ├── clinical_notes/             # Sample clinical notes for testing
 │   ├── models/                     # Serialized ML models (.pkl)
-│   └── policy_index.db             # SQLite FTS5 index (auto-created)
+│   ├── mimic-iv/                   # ← MIMIC-IV data (you download from PhysioNet)
+│   │   ├── hosp/                   #   patients, admissions, diagnoses_icd, etc.
+│   │   └── note/                   #   discharge, radiology, radiology_detail
+│   ├── policy_index.db             # SQLite FTS5 index (auto-created)
+│   └── base_rates.db               # SQLite base rates from CMS/KFF (auto-created)
 ├── src/
 │   ├── __init__.py                 # Exports: run_pipeline, build_pipeline, AuthorizeState
 │   ├── state.py                    # Shared pipeline state schema
@@ -27,11 +32,16 @@ authorizeai/
 │   │   ├── matching.py             # Agent 2: Payer Criteria Matching
 │   │   ├── prediction.py           # Agent 3: Approval Prediction
 │   │   └── drafting.py             # Agent 4: Submission Drafting
+│   ├── data/                       # ← NEW: data loading & evaluation
+│   │   ├── mimic_loader.py         # MIMIC-IV CSV reader + case assembler
+│   │   ├── public_rates.py         # CMS/KFF/state base rate ingestion
+│   │   ├── evaluation.py           # Pipeline eval harness (vs MIMIC ground truth)
+│   │   └── training_gen.py         # Training data generator (MIMIC + base rates)
 │   ├── retrieval/
 │   │   ├── indexer.py              # SQLite FTS5 indexing & chunking
 │   │   └── searcher.py             # BM25 search & context assembly
 │   ├── models/
-│   │   ├── features.py             # Feature engineering for prediction
+│   │   ├── features.py             # Feature engineering (now DB-backed)
 │   │   └── predictor.py            # ML model training & inference
 │   ├── prompts/
 │   │   └── templates.py            # All LLM prompt templates
@@ -244,18 +254,127 @@ Sidebar includes admin tools: index policy documents from `data/policies/` and t
 
 ---
 
-### `train_model.py`
+### `setup_data.py`
 
-CLI training script. Generates synthetic training data, trains the model with 5-fold CV, prints AUC metrics, and saves the model to `data/models/`.
+CLI for data initialization, MIMIC validation, evaluation, and MIMIC-based model training. Subcommands:
 
-Usage: `python train_model.py --model logistic --samples 2000`
+- **`validate`** — Checks `data/mimic-iv/` for required tables, reports what's found/missing
+- **`seed`** — Seeds the `base_rates.db` with KFF/CMS/AMA published rates. Optionally loads a CMS PUF CSV with `--cms-puf`
+- **`train --n 500`** — Loads N MIMIC cases, generates features using heuristic extraction, trains the prediction model
+- **`eval --n 10`** — Runs the full LLM pipeline on N MIMIC cases and evaluates extraction accuracy against MIMIC ground truth
+- **`summary`** — Prints all base rate data currently in the database
+
+---
+
+## Data Modules (NEW)
+
+### `src/data/mimic_loader.py`
+
+The core MIMIC-IV integration. Reads gzipped CSV files from the PhysioNet download and assembles them into `MIMICCase` objects that the pipeline can consume directly.
+
+**Tables it reads:**
+
+From `hosp/` module:
+- `patients.csv.gz` — demographics (gender, anchor_age)
+- `admissions.csv.gz` — admission details and insurance type (payer proxy)
+- `diagnoses_icd.csv.gz` — ICD-9/10 diagnosis codes per admission, with priority ranking
+- `procedures_icd.csv.gz` — ICD procedure codes per admission
+- `prescriptions.csv.gz` — medication orders (drug name, dosage, route, duration)
+
+From `note/` module:
+- `discharge.csv.gz` — free-text discharge summaries (this is what Agent 1 processes)
+- `radiology.csv.gz` — free-text radiology reports
+- `radiology_detail.csv.gz` — CPT codes and exam names for radiology studies
+
+**Key functions:**
+- **`load_all_cases(mimic_dir, limit)`** — Loads all tables, assembles `MIMICCase` objects by joining on `subject_id` and `hadm_id`. Returns a list.
+- **`case_to_pipeline_input(case)`** — Converts a `MIMICCase` into `run_pipeline()` kwargs. Maps MIMIC's insurance field to a payer ID and selects CPT code from radiology details.
+- **`case_to_ground_truth(case)`** — Extracts structured ground truth (ICD codes, drug list, demographics) for evaluating Agent 1 accuracy.
+- **`filter_cases_by_diagnosis(cases, icd_prefixes)`** — Filter to cases with specific diagnoses (e.g., `["M54", "M51"]` for back pain).
+- **`filter_cases_with_imaging(cases)`** — Filter to cases with radiology reports (highest PA relevance).
+- **`validate_mimic_directory()`** — Reports which tables exist, which are missing, and whether the directory is ready.
+
+**How MIMICCase maps to the pipeline:**
+- `primary_discharge_text` → `raw_clinical_text` (Agent 1 input)
+- `payer_proxy` → `payer_id` (derived from MIMIC `insurance` field: Medicare/Medicaid/Other)
+- `radiology_cpt_codes` → `procedure_code` (from `radiology_detail` CPT codes)
+- `icd10_codes` → ground truth for evaluating `diagnosis_codes` extraction
+- `drug_list` → ground truth for evaluating `prior_treatments` extraction
+
+---
+
+### `src/data/public_rates.py`
+
+Manages a SQLite database (`data/base_rates.db`) of publicly available PA outcome data. Two tables:
+
+**`payer_denial_rates`** — Payer-level denial rates with source tracking. Columns: `payer_id`, `payer_name`, `contract_id`, `year`, `total_requests`, `total_denials`, `denial_rate`, `appeal_rate`, `overturn_rate`, `source`. Sources are prioritized: `PAYER_DISCLOSURE` > `CMS_PUF` > `KFF` > `STATE_*`.
+
+**`procedure_approval_rates`** — Procedure-category approval rates. Columns: `procedure_category`, `cpt_codes` (JSON list), `approval_rate`, `denial_rate`, `sample_size`, `year`, `source`.
+
+**Key functions:**
+- **`seed_kff_base_rates()`** — Loads hardcoded rates from KFF's 2024 analysis (UHC 12.8%, Elevance 4.2%, etc.) and procedure-category rates from CMS OIG and AMA surveys. Zero network calls — these are published figures transcribed into code.
+- **`load_cms_puf(csv_path)`** — Parses the CMS Part C/D Reporting Requirements PUF (a downloadable CSV from cms.gov). Maps insurer names to canonical payer IDs via fuzzy matching.
+- **`load_payer_disclosure(payer_id, approval_pct, denial_pct, ...)`** — Manual entry point for payer-published PA metrics (the March 2026 mandate). Since these aren't yet in standardized format, you enter them after scraping each payer's website.
+- **`load_state_insurer_report(csv_path, state)`** — Loads Connecticut or Vermont state insurance department PA data.
+- **`get_payer_denial_rate(payer_id)`** — Query function used by `features.py`. Returns the best available denial rate for a payer, with source priority ordering.
+- **`get_procedure_approval_rate(category)`** — Query function used by `features.py`.
+
+---
+
+### `src/data/evaluation.py`
+
+Evaluation harness that uses MIMIC structured data as ground truth to measure pipeline quality.
+
+**`evaluate_extraction(case, extracted_state)`** — Compares Agent 1's extracted diagnosis codes and drug names against MIMIC's `diagnoses_icd` and `prescriptions` tables. Uses prefix matching for ICD codes (extracted `M54` matches true `M544`) and case-insensitive substring matching for drug names. Returns per-case precision, recall, F1 for diagnoses and recall for drugs.
+
+**`evaluate_pipeline_on_cases(cases, run_fn)`** — Batch evaluator. Runs the full pipeline on each case, collects extraction accuracy, coverage scores, approval probabilities, letter generation success, and timing. Prints per-case progress.
+
+**`summarize_eval_results(results)`** — Aggregates across all cases: mean diagnosis F1, mean drug recall, mean coverage score, success rate, average elapsed time.
+
+---
+
+### `src/data/training_gen.py`
+
+Generates labeled training data for Agent 3 by combining MIMIC clinical cases with public base rates. Two modes:
+
+**Heuristic mode** (default, free, fast) — Estimates features directly from MIMIC structured data without any LLM calls. Coverage score is approximated from documentation richness (diagnosis count, medication count, procedure count). Labels are generated probabilistically using the same logistic function calibrated against CMS/KFF base rates. Good for the hackathon prototype.
+
+**Agent mode** (requires LLM API calls) — Runs Agents 1+2 on each case to get real extraction and matching features. More accurate but costs ~$0.01-0.05 per case. Use for post-hackathon model improvement.
+
+Both modes produce `(X, y)` numpy arrays ready for `ApprovalPredictor.train()`.
+
+---
+
+### `src/models/features.py` (UPDATED)
+
+Now queries the `base_rates.db` SQLite database for payer denial rates and procedure approval rates before falling back to hardcoded dictionaries. This means when you load CMS PUF data or payer disclosures into the database, Agent 3's predictions automatically incorporate the latest public data without code changes.
+
+---
+
+## Data Audit: What's Real vs. Synthetic
+
+| Component | Source | Status |
+|-----------|--------|--------|
+| Clinical notes fed to Agent 1 | MIMIC-IV discharge summaries | **Real** — 331K de-identified notes from BIDMC |
+| Ground truth ICD codes | MIMIC-IV `diagnoses_icd` | **Real** — actual coded diagnoses |
+| Ground truth prescriptions | MIMIC-IV `prescriptions` | **Real** — actual medication orders |
+| Radiology CPT codes | MIMIC-IV `radiology_detail` | **Real** — actual procedure codes |
+| Patient demographics | MIMIC-IV `patients` | **Real** — de-identified age/gender |
+| Payer denial rates | KFF analysis of CMS PUF | **Real** — published aggregate rates |
+| Procedure approval rates | CMS OIG / AMA surveys | **Real** — published aggregate rates |
+| Payer-published PA metrics | March 2026 mandate disclosures | **Real** — payer website scrapes |
+| Coverage policy documents | Payer public websites | **Real** — but manually collected |
+| PA outcome labels (approved/denied) | Generated from base rates | **Synthetic** — no case-level outcome data |
+| Coverage score for training | Heuristic from MIMIC structure | **Estimated** — not from actual Agent 2 |
+
+**The one thing that's still synthetic:** case-level approval/denial labels. There is no public dataset mapping individual PA requests to outcomes. The labels are probabilistic, calibrated against real aggregate rates. This is the honest framing for judges: "real clinical data, real base rates, synthetic labels pending real outcome data from a pilot partner."
 
 ---
 
 ## Quickstart
 
 ```bash
-# 1. Clone and install
+# 1. Install
 cd authorizeai
 pip install -r requirements.txt
 
@@ -263,18 +382,34 @@ pip install -r requirements.txt
 cp .env.example .env
 # Edit .env with your API key
 
-# 3. Add policy documents to data/policies/
+# 3. Download MIMIC-IV from PhysioNet into data/mimic-iv/
+#    hosp module: https://physionet.org/content/mimiciv/2.2/
+#    note module: https://physionet.org/content/mimic-iv-note/2.2/
+
+# 4. Validate MIMIC directory
+python setup_data.py validate
+
+# 5. Seed public base rates
+python setup_data.py seed
+
+# 6. Add policy documents to data/policies/
 #    Format: PAYER_PROCEDURE.txt or .json with logic_tree
 
-# 4. Index policies
+# 7. Index policies
 python -c "from src.retrieval.indexer import init_db, bulk_index_from_directory; \
            conn = init_db(); print(f'Indexed {bulk_index_from_directory(\"data/policies\", conn)} chunks')"
 
-# 5. Train prediction model
+# 8. Train prediction model (option A: MIMIC-based)
+python setup_data.py train --n 500 --model logistic
+
+# 8. Train prediction model (option B: synthetic only, no MIMIC needed)
 python train_model.py --model logistic --samples 2000
 
-# 6. Run demo
+# 9. Run demo
 streamlit run app.py
+
+# 10. Evaluate pipeline against MIMIC ground truth
+python setup_data.py eval --n 10
 ```
 
 ---

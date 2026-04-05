@@ -121,18 +121,24 @@ def extract_features(state: AuthorizeState) -> FeatureVector:
         if t.outcome.lower() in ("failed", "partial")
     )
 
-    # Historical base rates
+    # Historical base rates — try database first, fall back to hardcoded
     payer_key = state.payer_id.upper()
-    payer_denial = PAYER_DENIAL_RATES.get(
-        payer_key, PAYER_DENIAL_RATES["DEFAULT"]
-    )
-
     proc_category = CPT_TO_CATEGORY.get(
         state.extracted_procedure_code or state.procedure_code, "DEFAULT"
     )
-    proc_approval = PROCEDURE_CATEGORY_APPROVAL_RATES.get(
-        proc_category, PROCEDURE_CATEGORY_APPROVAL_RATES["DEFAULT"]
-    )
+
+    try:
+        from ..data.public_rates import get_payer_denial_rate, get_procedure_approval_rate
+        payer_denial = get_payer_denial_rate(payer_key)
+        proc_approval = get_procedure_approval_rate(proc_category)
+    except Exception:
+        # Database not initialized — use hardcoded fallbacks
+        payer_denial = PAYER_DENIAL_RATES.get(
+            payer_key, PAYER_DENIAL_RATES["DEFAULT"]
+        )
+        proc_approval = PROCEDURE_CATEGORY_APPROVAL_RATES.get(
+            proc_category, PROCEDURE_CATEGORY_APPROVAL_RATES["DEFAULT"]
+        )
 
     # Demographics
     age = float(state.patient_demographics.get("age", 50) or 50)
