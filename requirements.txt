@@ -1,0 +1,21 @@
+# ── Core Framework ──
+langgraph>=0.2.0
+langchain-core>=0.3.0
+
+# ── LLM Providers (install one or both) ──
+anthropic>=0.39.0
+# openai>=1.50.0
+
+# ── ML / Data ──
+scikit-learn>=1.4.0
+numpy>=1.26.0
+
+# ── Document Processing ──
+PyMuPDF>=1.24.0
+
+# ── Demo UI ──
+streamlit>=1.38.0
+
+# ── Optional: dev/test ──
+# pytest>=8.0.0
+# python-dotenv>=1.0.0
