@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 AuthorizeAI — MIMIC-IV Data Loader
 ====================================
@@ -20,12 +22,33 @@ Expected directory layout (after PhysioNet download):
         ├── radiology.csv.gz
         └── radiology_detail.csv.gz
 """
+"""
+AuthorizeAI — MIMIC-IV Loader
+================================
+Reads MIMIC-IV CSVs from a local PhysioNet download and assembles
+MIMICCase objects for the pipeline.
 
-from __future__ import annotations
+Loophole fixes applied:
+  #1 OOM: load_all_cases now streams discharge notes with early stop,
+         then filters all downstream tables by the collected hadm_ids.
+         Previously, every table was read fully into memory before
+         `limit` was applied — OOM on 16GB laptops.
+  #2 Payer proxy: MIMIC's insurance field is de-identified. Values are
+         now mapped via PAYER_PROXY_MAP to explicit _PROXY-suffixed labels
+         and a one-shot UserWarning is emitted on first use.
+  #3 CPT selection: radiology_cpt_codes is now deduped + sorted before
+         picking [0], making the choice deterministic across runs.
+  #4 Retrospective notes: case_to_pipeline_input emits a one-shot
+         UserWarning explaining that discharge summaries are not
+         prospective PA documentation.
+
+"""
+
 
 import csv
 import gzip
 import json
+import warnings
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,8 +56,60 @@ from typing import Iterator
 
 
 # ── Default paths ──────────────────────────────────────────────────────────
+# This file lives at <project>/data/mimic_loader.py, so .parent is data/.
+DEFAULT_MIMIC_DIR = Path(__file__).resolve().parent / "mimic-iv"
 
-DEFAULT_MIMIC_DIR = Path(__file__).resolve().parents[2] / "data" / "mimic-iv"
+
+# ── Payer proxy mapping (loophole #2) ──────────────────────────────────────
+# MIMIC's admissions.insurance column is NOT a real payer identifier.
+# BIDMC de-identified it. You CANNOT recover "UHC" or "Aetna" from MIMIC.
+# These proxy values are explicitly _PROXY-suffixed so downstream code
+# cannot accidentally mistake them for real payer data.
+PAYER_PROXY_MAP = {
+    "medicare":   "CMS_MEDICARE_PROXY",
+    "medicaid":   "CMS_MEDICAID_PROXY",
+    "private":    "COMMERCIAL_GENERIC_PROXY",
+    "other":      "COMMERCIAL_GENERIC_PROXY",
+    "self pay":   "SELF_PAY_PROXY",
+    "self-pay":   "SELF_PAY_PROXY",
+    "government": "GOVERNMENT_OTHER_PROXY",
+}
+_DEFAULT_PAYER_PROXY = "UNKNOWN_PROXY"
+
+# One-shot warning flags
+_payer_proxy_warning_shown = False
+_retrospective_warning_shown = False
+
+
+def _warn_payer_proxy_once() -> None:
+    global _payer_proxy_warning_shown
+    if not _payer_proxy_warning_shown:
+        warnings.warn(
+            "MIMIC does not contain real payer identifiers. payer_proxy "
+            "values (CMS_MEDICARE_PROXY, COMMERCIAL_GENERIC_PROXY, etc.) "
+            "are synthetic and must NOT be interpreted as real payer data. "
+            "Any Agent 2 policy match against these values is for pipeline "
+            "validation only, not a real payer-policy evaluation.",
+            UserWarning,
+            stacklevel=3,
+        )
+        _payer_proxy_warning_shown = True
+
+
+def _warn_retrospective_once() -> None:
+    global _retrospective_warning_shown
+    if not _retrospective_warning_shown:
+        warnings.warn(
+            "MIMIC discharge summaries are RETROSPECTIVE end-of-stay "
+            "narratives, not PROSPECTIVE PA request documentation. "
+            "Agent 1 will conflate in-admission treatments with truly "
+            "prior treatments. Treat extraction/pipeline evaluation "
+            "results as an upper bound, not a faithful reflection of "
+            "real-world PA performance.",
+            UserWarning,
+            stacklevel=3,
+        )
+        _retrospective_warning_shown = True
 
 
 # ── Data structures ────────────────────────────────────────────────────────
@@ -54,7 +129,7 @@ class MIMICAdmission:
     admittime: str = ""
     dischtime: str = ""
     admission_type: str = ""
-    insurance: str = ""       # payer proxy: "Medicare", "Medicaid", "Other"
+    insurance: str = ""       # de-identified payer proxy — see PAYER_PROXY_MAP
     race: str = ""
 
 
@@ -63,8 +138,8 @@ class MIMICDiagnosis:
     hadm_id: str
     subject_id: str
     icd_code: str = ""
-    icd_version: int = 10     # 9 or 10
-    seq_num: int = 0          # priority rank
+    icd_version: int = 10
+    seq_num: int = 0
 
 
 @dataclass
@@ -81,7 +156,7 @@ class MIMICPrescription:
     hadm_id: str
     subject_id: str
     drug: str = ""
-    drug_type: str = ""       # "MAIN", "BASE", "ADDITIVE"
+    drug_type: str = ""
     route: str = ""
     dose_val_rx: str = ""
     dose_unit_rx: str = ""
@@ -113,15 +188,13 @@ class MIMICRadiologyDetail:
     subject_id: str
     field_name: str = ""
     field_value: str = ""
-    # field_name includes: "exam_name", "cpt_code", "parent_note_id"
 
 
 @dataclass
 class MIMICCase:
     """
     A fully assembled clinical case combining structured data with
-    free-text notes for a single hospitalization. This is what gets
-    fed into the AuthorizeAI pipeline.
+    free-text notes for a single hospitalization.
     """
     subject_id: str
     hadm_id: str
@@ -136,14 +209,12 @@ class MIMICCase:
 
     @property
     def primary_discharge_text(self) -> str:
-        """Return the longest discharge note (typically the main summary)."""
         if not self.discharge_notes:
             return ""
         return max(self.discharge_notes, key=lambda n: len(n.text)).text
 
     @property
     def icd10_codes(self) -> list[str]:
-        """Return ICD-10 diagnosis codes sorted by priority."""
         return [
             d.icd_code for d in sorted(self.diagnoses, key=lambda d: d.seq_num)
             if d.icd_version == 10
@@ -158,7 +229,6 @@ class MIMICCase:
 
     @property
     def drug_list(self) -> list[str]:
-        """Unique drug names prescribed during this admission."""
         seen = set()
         drugs = []
         for p in self.prescriptions:
@@ -170,40 +240,43 @@ class MIMICCase:
 
     @property
     def radiology_cpt_codes(self) -> list[str]:
-        """CPT codes from radiology studies during this admission."""
-        return [
+        """CPT codes from radiology studies. Deduped + sorted for determinism."""
+        codes = {
             d.field_value for d in self.radiology_details
             if d.field_name == "cpt_code" and d.field_value
-        ]
+        }
+        return sorted(codes)
 
     @property
     def payer_proxy(self) -> str:
         """
-        Map MIMIC insurance field to a payer ID usable by the pipeline.
-        MIMIC uses: 'Medicare', 'Medicaid', 'Other' (commercial).
+        Map MIMIC insurance field to a proxy payer ID.
+
+        WARNING: This is NOT a real payer. MIMIC's insurance field is
+        de-identified. All return values are _PROXY-suffixed to signal
+        this to downstream code. First call emits a UserWarning.
         """
+        _warn_payer_proxy_once()
         if not self.admission:
-            return "UHC"
-        ins = self.admission.insurance.lower()
-        if "medicare" in ins:
-            return "MEDICARE"
-        elif "medicaid" in ins:
-            return "MEDICAID"
-        else:
-            return "UHC"  # default commercial payer for prototype
+            return _DEFAULT_PAYER_PROXY
+        ins = self.admission.insurance.lower().strip()
+        if not ins:
+            return _DEFAULT_PAYER_PROXY
+        for key, proxy in PAYER_PROXY_MAP.items():
+            if key in ins:
+                return proxy
+        return "COMMERCIAL_GENERIC_PROXY"
 
 
 # ── CSV readers ────────────────────────────────────────────────────────────
 
 def _read_gz_csv(filepath: Path) -> Iterator[dict]:
-    """Stream rows from a gzipped CSV file."""
     with gzip.open(filepath, "rt", encoding="utf-8", errors="replace") as f:
         reader = csv.DictReader(f)
         yield from reader
 
 
 def _read_csv(filepath: Path) -> Iterator[dict]:
-    """Read from either .csv.gz or .csv."""
     if filepath.suffix == ".gz":
         return _read_gz_csv(filepath)
     else:
@@ -213,9 +286,11 @@ def _read_csv(filepath: Path) -> Iterator[dict]:
 
 
 # ── Loaders for individual tables ──────────────────────────────────────────
+# Big tables now accept optional `target_hadm_ids` (or `target_note_ids`)
+# set for row-level filtering during streaming. Pass None to load everything
+# (preserves the old behavior for anyone who calls these directly).
 
 def load_patients(mimic_dir: Path = DEFAULT_MIMIC_DIR) -> dict[str, MIMICPatient]:
-    """Load patients table → dict keyed by subject_id."""
     path = _find_file(mimic_dir / "hosp", "patients")
     patients = {}
     for row in _read_csv(path):
@@ -223,14 +298,13 @@ def load_patients(mimic_dir: Path = DEFAULT_MIMIC_DIR) -> dict[str, MIMICPatient
         patients[sid] = MIMICPatient(
             subject_id=sid,
             gender=row.get("gender", ""),
-            anchor_age=int(row.get("anchor_age", 0)),
-            anchor_year=int(row.get("anchor_year", 0)),
+            anchor_age=int(row.get("anchor_age", 0) or 0),
+            anchor_year=int(row.get("anchor_year", 0) or 0),
         )
     return patients
 
 
 def load_admissions(mimic_dir: Path = DEFAULT_MIMIC_DIR) -> dict[str, list[MIMICAdmission]]:
-    """Load admissions → dict keyed by subject_id (one patient can have many admissions)."""
     path = _find_file(mimic_dir / "hosp", "admissions")
     admissions: dict[str, list[MIMICAdmission]] = defaultdict(list)
     for row in _read_csv(path):
@@ -247,45 +321,57 @@ def load_admissions(mimic_dir: Path = DEFAULT_MIMIC_DIR) -> dict[str, list[MIMIC
     return dict(admissions)
 
 
-def load_diagnoses(mimic_dir: Path = DEFAULT_MIMIC_DIR) -> dict[str, list[MIMICDiagnosis]]:
-    """Load diagnoses_icd → dict keyed by hadm_id."""
+def load_diagnoses(
+    mimic_dir: Path = DEFAULT_MIMIC_DIR,
+    target_hadm_ids: set[str] | None = None,
+) -> dict[str, list[MIMICDiagnosis]]:
     path = _find_file(mimic_dir / "hosp", "diagnoses_icd")
     diag: dict[str, list[MIMICDiagnosis]] = defaultdict(list)
     for row in _read_csv(path):
         hid = row["hadm_id"]
+        if target_hadm_ids is not None and hid not in target_hadm_ids:
+            continue
         diag[hid].append(MIMICDiagnosis(
             hadm_id=hid,
             subject_id=row["subject_id"],
             icd_code=row.get("icd_code", ""),
-            icd_version=int(row.get("icd_version", 10)),
-            seq_num=int(row.get("seq_num", 0)),
+            icd_version=int(row.get("icd_version", 10) or 10),
+            seq_num=int(row.get("seq_num", 0) or 0),
         ))
     return dict(diag)
 
 
-def load_procedures(mimic_dir: Path = DEFAULT_MIMIC_DIR) -> dict[str, list[MIMICProcedure]]:
-    """Load procedures_icd → dict keyed by hadm_id."""
+def load_procedures(
+    mimic_dir: Path = DEFAULT_MIMIC_DIR,
+    target_hadm_ids: set[str] | None = None,
+) -> dict[str, list[MIMICProcedure]]:
     path = _find_file(mimic_dir / "hosp", "procedures_icd")
     procs: dict[str, list[MIMICProcedure]] = defaultdict(list)
     for row in _read_csv(path):
         hid = row["hadm_id"]
+        if target_hadm_ids is not None and hid not in target_hadm_ids:
+            continue
         procs[hid].append(MIMICProcedure(
             hadm_id=hid,
             subject_id=row["subject_id"],
             icd_code=row.get("icd_code", ""),
-            icd_version=int(row.get("icd_version", 10)),
-            seq_num=int(row.get("seq_num", 0)),
+            icd_version=int(row.get("icd_version", 10) or 10),
+            seq_num=int(row.get("seq_num", 0) or 0),
         ))
     return dict(procs)
 
 
-def load_prescriptions(mimic_dir: Path = DEFAULT_MIMIC_DIR) -> dict[str, list[MIMICPrescription]]:
-    """Load prescriptions → dict keyed by hadm_id."""
+def load_prescriptions(
+    mimic_dir: Path = DEFAULT_MIMIC_DIR,
+    target_hadm_ids: set[str] | None = None,
+) -> dict[str, list[MIMICPrescription]]:
     path = _find_file(mimic_dir / "hosp", "prescriptions")
     meds: dict[str, list[MIMICPrescription]] = defaultdict(list)
     for row in _read_csv(path):
         hid = row.get("hadm_id", "")
         if not hid:
+            continue
+        if target_hadm_ids is not None and hid not in target_hadm_ids:
             continue
         meds[hid].append(MIMICPrescription(
             hadm_id=hid,
@@ -301,13 +387,23 @@ def load_prescriptions(mimic_dir: Path = DEFAULT_MIMIC_DIR) -> dict[str, list[MI
     return dict(meds)
 
 
-def load_discharge_notes(mimic_dir: Path = DEFAULT_MIMIC_DIR) -> dict[str, list[MIMICDischargeNote]]:
-    """Load discharge summaries → dict keyed by hadm_id."""
+def load_discharge_notes(
+    mimic_dir: Path = DEFAULT_MIMIC_DIR,
+    limit: int | None = None,
+    target_hadm_ids: set[str] | None = None,
+) -> dict[str, list[MIMICDischargeNote]]:
+    """
+    Stream discharge summaries. If `limit` is set, stop after that many
+    distinct hadm_ids have been collected (early termination — critical
+    for avoiding OOM on the full note.discharge.csv.gz file).
+    """
     path = _find_file(mimic_dir / "note", "discharge")
     notes: dict[str, list[MIMICDischargeNote]] = defaultdict(list)
     for row in _read_csv(path):
         hid = row.get("hadm_id", "")
         if not hid:
+            continue
+        if target_hadm_ids is not None and hid not in target_hadm_ids:
             continue
         notes[hid].append(MIMICDischargeNote(
             note_id=row.get("note_id", ""),
@@ -316,16 +412,22 @@ def load_discharge_notes(mimic_dir: Path = DEFAULT_MIMIC_DIR) -> dict[str, list[
             charttime=row.get("charttime", ""),
             text=row.get("text", ""),
         ))
+        if limit is not None and len(notes) >= limit:
+            break
     return dict(notes)
 
 
-def load_radiology_reports(mimic_dir: Path = DEFAULT_MIMIC_DIR) -> dict[str, list[MIMICRadiologyReport]]:
-    """Load radiology reports → dict keyed by hadm_id."""
+def load_radiology_reports(
+    mimic_dir: Path = DEFAULT_MIMIC_DIR,
+    target_hadm_ids: set[str] | None = None,
+) -> dict[str, list[MIMICRadiologyReport]]:
     path = _find_file(mimic_dir / "note", "radiology")
     reports: dict[str, list[MIMICRadiologyReport]] = defaultdict(list)
     for row in _read_csv(path):
         hid = row.get("hadm_id", "")
         if not hid:
+            continue
+        if target_hadm_ids is not None and hid not in target_hadm_ids:
             continue
         reports[hid].append(MIMICRadiologyReport(
             note_id=row.get("note_id", ""),
@@ -337,12 +439,16 @@ def load_radiology_reports(mimic_dir: Path = DEFAULT_MIMIC_DIR) -> dict[str, lis
     return dict(reports)
 
 
-def load_radiology_details(mimic_dir: Path = DEFAULT_MIMIC_DIR) -> dict[str, list[MIMICRadiologyDetail]]:
-    """Load radiology_detail → dict keyed by note_id."""
+def load_radiology_details(
+    mimic_dir: Path = DEFAULT_MIMIC_DIR,
+    target_note_ids: set[str] | None = None,
+) -> dict[str, list[MIMICRadiologyDetail]]:
     path = _find_file(mimic_dir / "note", "radiology_detail")
     details: dict[str, list[MIMICRadiologyDetail]] = defaultdict(list)
     for row in _read_csv(path):
         nid = row.get("note_id", "")
+        if target_note_ids is not None and nid not in target_note_ids:
+            continue
         details[nid].append(MIMICRadiologyDetail(
             note_id=nid,
             subject_id=row.get("subject_id", ""),
@@ -365,10 +471,6 @@ def assemble_case(
     radiology_reports: dict[str, list[MIMICRadiologyReport]] | None = None,
     radiology_details: dict[str, list[MIMICRadiologyDetail]] | None = None,
 ) -> MIMICCase | None:
-    """
-    Assemble a complete MIMICCase for a single hospitalization.
-    Returns None if the hadm_id cannot be found in discharge notes.
-    """
     notes = discharge_notes.get(hadm_id, [])
     if not notes:
         return None
@@ -376,14 +478,12 @@ def assemble_case(
     subject_id = notes[0].subject_id
     patient = patients.get(subject_id)
 
-    # Find the matching admission
     admission = None
     for adm in admissions_by_subject.get(subject_id, []):
         if adm.hadm_id == hadm_id:
             admission = adm
             break
 
-    # Collect radiology details by note_id
     rad_details = []
     if radiology_details:
         for report in (radiology_reports or {}).get(hadm_id, []):
@@ -410,54 +510,80 @@ def load_all_cases(
     require_radiology: bool = False,
 ) -> list[MIMICCase]:
     """
-    Load and assemble all clinical cases from MIMIC-IV.
+    Load and assemble clinical cases from MIMIC-IV using streaming reads
+    with target-set filtering to bound memory.
 
-    Args:
-        mimic_dir: Root directory containing hosp/ and note/ subdirs
-        limit: Max number of cases to load (None = all)
-        require_discharge_note: Only include cases with discharge notes
-        require_radiology: Only include cases with radiology reports
+    Strategy (loophole #1 fix):
+      1. Load small tables (patients, admissions) in full.
+      2. Stream discharge notes with early stop at `limit * 3` (oversample
+         so the downstream require_radiology filter can still hit `limit`
+         cases).
+      3. Use the collected hadm_ids as a filter set for every large table.
+      4. Assemble cases and stop once `limit` is reached.
 
-    Returns:
-        List of assembled MIMICCase objects
+    Memory footprint is now bounded by `limit`, not by MIMIC table sizes.
     """
-    print("Loading MIMIC-IV tables...")
+    print("Loading MIMIC-IV tables (streaming mode)...")
+
+    # Small tables — load in full
     patients = load_patients(mimic_dir)
     print(f"  patients: {len(patients)}")
 
     admissions = load_admissions(mimic_dir)
     print(f"  admissions: {sum(len(v) for v in admissions.values())}")
 
-    diagnoses = load_diagnoses(mimic_dir)
-    print(f"  diagnoses: {sum(len(v) for v in diagnoses.values())}")
+    # Discharge notes first, with early stop — this anchors the cohort.
+    # Oversample 3x if we have a radiology requirement, since many cases
+    # won't have radiology and will be filtered out downstream.
+    if limit is not None:
+        note_load_limit = limit * 3 if require_radiology else limit * 2
+    else:
+        note_load_limit = None
 
-    procedures = load_procedures(mimic_dir)
-    print(f"  procedures: {sum(len(v) for v in procedures.values())}")
+    discharge_notes = load_discharge_notes(mimic_dir, limit=note_load_limit)
+    print(f"  discharge notes loaded: {len(discharge_notes)} hadm_ids")
 
-    prescriptions = load_prescriptions(mimic_dir)
-    print(f"  prescriptions: {sum(len(v) for v in prescriptions.values())}")
+    target_hadm_ids: set[str] = set(discharge_notes.keys())
+    print(f"  target cohort: {len(target_hadm_ids)} hadm_ids")
 
-    discharge_notes = load_discharge_notes(mimic_dir)
-    print(f"  discharge notes: {sum(len(v) for v in discharge_notes.values())}")
+    # Big tables — filter to target cohort during streaming
+    diagnoses = load_diagnoses(mimic_dir, target_hadm_ids=target_hadm_ids)
+    print(f"  diagnoses (filtered): {sum(len(v) for v in diagnoses.values())}")
+
+    procedures = load_procedures(mimic_dir, target_hadm_ids=target_hadm_ids)
+    print(f"  procedures (filtered): {sum(len(v) for v in procedures.values())}")
+
+    prescriptions = load_prescriptions(mimic_dir, target_hadm_ids=target_hadm_ids)
+    print(f"  prescriptions (filtered): {sum(len(v) for v in prescriptions.values())}")
 
     radiology_reports = None
     radiology_details = None
     rad_path = mimic_dir / "note"
     if (rad_path / "radiology.csv.gz").exists() or (rad_path / "radiology.csv").exists():
-        radiology_reports = load_radiology_reports(mimic_dir)
-        print(f"  radiology reports: {sum(len(v) for v in radiology_reports.values())}")
+        radiology_reports = load_radiology_reports(
+            mimic_dir, target_hadm_ids=target_hadm_ids,
+        )
+        print(f"  radiology reports (filtered): {sum(len(v) for v in radiology_reports.values())}")
+
+        # Collect note_ids from the filtered reports for detail filtering
+        target_note_ids: set[str] = set()
+        for reports in radiology_reports.values():
+            for r in reports:
+                if r.note_id:
+                    target_note_ids.add(r.note_id)
+
         try:
-            radiology_details = load_radiology_details(mimic_dir)
-            print(f"  radiology details: {sum(len(v) for v in radiology_details.values())}")
+            radiology_details = load_radiology_details(
+                mimic_dir, target_note_ids=target_note_ids,
+            )
+            print(f"  radiology details (filtered): {sum(len(v) for v in radiology_details.values())}")
         except FileNotFoundError:
             pass
 
     # Assemble cases
     print("\nAssembling cases...")
     cases = []
-    hadm_ids = list(discharge_notes.keys())
-
-    for hadm_id in hadm_ids:
+    for hadm_id in discharge_notes.keys():
         case = assemble_case(
             hadm_id, patients, admissions, diagnoses,
             procedures, prescriptions, discharge_notes,
@@ -482,10 +608,6 @@ def filter_cases_by_procedure_codes(
     target_cpt_codes: list[str] | None = None,
     target_icd_proc_codes: list[str] | None = None,
 ) -> list[MIMICCase]:
-    """
-    Filter cases that involve specific procedures.
-    Useful for finding cases relevant to AuthorizeAI's 10 target procedures.
-    """
     filtered = []
     for case in cases:
         if target_cpt_codes:
@@ -503,10 +625,6 @@ def filter_cases_by_diagnosis(
     cases: list[MIMICCase],
     icd_prefixes: list[str],
 ) -> list[MIMICCase]:
-    """
-    Filter cases where any diagnosis code starts with the given prefixes.
-    Example: icd_prefixes=["M54", "M51"] for low back pain / disc disorders.
-    """
     filtered = []
     for case in cases:
         all_codes = case.icd10_codes + case.icd9_codes
@@ -520,7 +638,6 @@ def filter_cases_by_diagnosis(
 
 
 def filter_cases_with_imaging(cases: list[MIMICCase]) -> list[MIMICCase]:
-    """Return only cases that have radiology reports — high PA relevance."""
     return [c for c in cases if c.radiology_reports]
 
 
@@ -533,16 +650,21 @@ def case_to_pipeline_input(
     """
     Convert a MIMICCase into kwargs for run_pipeline().
 
-    If no procedure_code is provided, attempts to infer one from
-    radiology CPT codes or defaults to a generic imaging code.
+    WARNING (loophole #4): MIMIC discharge summaries are retrospective
+    end-of-stay narratives, not prospective PA request documentation.
+    This function emits a one-shot UserWarning on first call to make
+    sure callers know what they're feeding into Agent 1.
+
+    CPT selection (loophole #3): if no procedure_code is explicitly
+    provided, the first CPT from radiology_cpt_codes is used. That list
+    is now deduped + sorted, so the choice is deterministic across runs.
+    Fallback is CPT 72148 (MRI lumbar) if the case has no radiology.
     """
-    # Determine procedure code
+    _warn_retrospective_once()
+
     if not procedure_code:
-        cpts = case.radiology_cpt_codes
-        if cpts:
-            procedure_code = cpts[0]
-        else:
-            procedure_code = "72148"  # default: MRI lumbar
+        cpts = case.radiology_cpt_codes  # already sorted + deduped
+        procedure_code = cpts[0] if cpts else "72148"
 
     return {
         "clinical_text": case.primary_discharge_text,
@@ -553,10 +675,6 @@ def case_to_pipeline_input(
 
 
 def case_to_ground_truth(case: MIMICCase) -> dict:
-    """
-    Extract structured ground truth from MIMIC structured data.
-    Used to evaluate Agent 1's extraction accuracy.
-    """
     return {
         "diagnosis_codes": case.icd10_codes or case.icd9_codes,
         "procedure_codes": [p.icd_code for p in case.procedures],
@@ -574,7 +692,6 @@ def case_to_ground_truth(case: MIMICCase) -> dict:
 # ── Utility ────────────────────────────────────────────────────────────────
 
 def _find_file(directory: Path, table_name: str) -> Path:
-    """Find a CSV file by table name, checking .csv.gz and .csv variants."""
     for ext in [".csv.gz", ".csv"]:
         path = directory / f"{table_name}{ext}"
         if path.exists():
@@ -586,16 +703,13 @@ def _find_file(directory: Path, table_name: str) -> Path:
 
 
 def validate_mimic_directory(mimic_dir: Path = DEFAULT_MIMIC_DIR) -> dict:
-    """
-    Check which MIMIC-IV tables are available and return a status report.
-    """
     required_hosp = ["patients", "admissions", "diagnoses_icd",
                      "procedures_icd", "prescriptions"]
     required_note = ["discharge"]
     optional_note = ["radiology", "radiology_detail", "discharge_detail"]
     optional_hosp = ["labevents"]
 
-    report = {"found": [], "missing": [], "optional_missing": []}
+    report = {"found": [], "missing": [], "optional_missing": [], "ready": False}
 
     for table in required_hosp:
         try:

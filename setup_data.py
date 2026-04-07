@@ -17,17 +17,17 @@ import json
 import sys
 from pathlib import Path
 
-from src.data.mimic_loader import (
+from data.mimic_loader import (
     validate_mimic_directory, load_all_cases,
     filter_cases_with_imaging, filter_cases_by_diagnosis,
     DEFAULT_MIMIC_DIR,
 )
-from src.data.public_rates import (
+from data.public_rates import (
     init_base_rate_db, seed_kff_base_rates,
     load_cms_puf, DB_PATH,
 )
-from src.data.training_gen import generate_training_data_from_mimic
-from src.data.evaluation import (
+from data.training_gen import generate_training_data_from_mimic
+from data.evaluation import (
     evaluate_pipeline_on_cases, summarize_eval_results,
 )
 from src.models.predictor import ApprovalPredictor

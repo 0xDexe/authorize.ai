@@ -8,40 +8,57 @@ Loads publicly available prior authorization outcome data from:
   4. KFF/AMA published base rates (hardcoded from reports)
 
 All sources are public domain — no credentials required except MIMIC-IV.
+
+Loophole fixes applied:
+  #8 Swallowed DB errors: get_payer_denial_rate and
+     get_procedure_approval_rate previously caught every exception
+     silently and fell through to hardcoded defaults. They now log at
+     WARNING level whenever the DB lookup fails so you can tell the
+     difference between "payer not in DB" (expected) and "DB broken"
+     (a bug). Falls back to sensible defaults but never silently.
+
+Path fix: data/ is now a top-level sibling of src/, so DB_PATH uses
+parent (the data/ folder itself), not parents[2].
 """
 
 from __future__ import annotations
 
 import csv
 import json
+import logging
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
-DB_PATH = Path(__file__).resolve().parents[2] / "data" / "base_rates.db"
+logger = logging.getLogger(__name__)
+
+# This file lives at <project>/data/public_rates.py, so .parent is data/.
+DB_PATH = Path(__file__).resolve().parent / "base_rates.db"
+
+# Fallback constants (single source of truth — matches features.py fallbacks)
+_NATIONAL_AVG_DENIAL_RATE = 0.077
+_NATIONAL_AVG_APPROVAL_RATE = 0.85
 
 
 # ── Data structures ────────────────────────────────────────────────────────
 
 @dataclass
 class PayerDenialRate:
-    """Contract-level denial rate from CMS PUF or payer disclosures."""
-    payer_id: str              # normalized: "UHC", "AETNA", etc.
-    payer_name: str            # full name
-    contract_id: str = ""      # CMS MA contract ID (e.g. H1234)
+    payer_id: str
+    payer_name: str
+    contract_id: str = ""
     year: int = 2024
     total_requests: int = 0
     total_denials: int = 0
     denial_rate: float = 0.0
-    appeal_rate: float = 0.0   # % of denials appealed
-    overturn_rate: float = 0.0 # % of appeals overturned
-    source: str = ""           # "CMS_PUF", "PAYER_DISCLOSURE", "KFF"
+    appeal_rate: float = 0.0
+    overturn_rate: float = 0.0
+    source: str = ""
 
 
 @dataclass
 class ProcedureApprovalRate:
-    """Procedure-category-level approval rates from CMS FFS or literature."""
-    procedure_category: str    # "MRI", "CT", "SPECIALTY_REFERRAL", etc.
+    procedure_category: str
     cpt_codes: list[str] = field(default_factory=list)
     approval_rate: float = 0.0
     denial_rate: float = 0.0
@@ -100,16 +117,9 @@ def load_cms_puf(
     """
     Load the CMS Part C Reporting Requirements Public Use File.
 
-    The PUF is a CSV with contract-level PA data. Download from:
+    Download from:
     https://www.cms.gov/data-research/cms-data/limited-data-set-lds-files/
     parts-c-d-reporting-requirements-limited-data-set
-
-    Relevant columns vary by year but typically include:
-    - contract_id, organization_name
-    - prior_auth_requests, prior_auth_approvals, prior_auth_denials
-    - appeals_filed, appeals_overturned
-
-    Returns number of records loaded.
     """
     if conn is None:
         conn = init_base_rate_db()
@@ -120,7 +130,6 @@ def load_cms_puf(
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            # Column names vary — normalize common variants
             contract_id = (
                 row.get("contract_id", "") or
                 row.get("Contract ID", "") or
@@ -192,13 +201,6 @@ def load_payer_disclosure(
 ) -> None:
     """
     Manually enter payer-published PA metrics from their public websites.
-
-    As of March 31, 2026, payers must post aggregated PA metrics annually.
-    Since these aren't yet in a standardized downloadable format, you'll
-    scrape or manually enter them from each payer's website.
-
-    Example:
-        load_payer_disclosure("UHC", "UnitedHealthcare", 87.2, 12.8, 80.7, 12000000)
     """
     if conn is None:
         conn = init_base_rate_db()
@@ -227,17 +229,10 @@ def seed_kff_base_rates(conn: sqlite3.Connection | None = None) -> int:
     """
     Seed the database with published base rates from KFF analysis of
     CMS data (2024) and AMA physician survey data.
-
-    These are aggregated, publicly available figures — no credentials needed.
-    Sources:
-      - KFF: "MA Insurers Made Nearly 53M PA Determinations in 2024"
-      - AMA: "2023 AMA Prior Authorization Physician Survey"
-      - CMS OIG: "MAO Denials of PA Requests" (2022 report)
     """
     if conn is None:
         conn = init_base_rate_db()
 
-    # Payer-level rates from KFF 2024 analysis
     kff_payer_rates = [
         ("UHC", "UnitedHealthcare", 0.128, 53_000_000),
         ("ELEVANCE", "Elevance Health (Anthem)", 0.042, 53_000_000),
@@ -257,7 +252,6 @@ def seed_kff_base_rates(conn: sqlite3.Connection | None = None) -> int:
              int(total * drate), drate, 0.115, 0.807, "KFF"),
         )
 
-    # Procedure-category rates from CMS FFS + radiology PA studies
     proc_rates = [
         ("MRI", ["72148", "70553", "75557"], 0.88, 2024, "CMS_FFS_OIG"),
         ("CT", ["74177", "71260"], 0.91, 2024, "CMS_FFS_OIG"),
@@ -284,6 +278,16 @@ def seed_kff_base_rates(conn: sqlite3.Connection | None = None) -> int:
 
 
 # ── Query interface (used by features.py) ──────────────────────────────────
+#
+# Loophole #8 fix: previously these functions silently caught every
+# exception and returned a hardcoded default. That made it impossible
+# to tell the difference between "payer not in DB" (expected — fall
+# back to default) and "DB file is corrupt / table missing / path wrong"
+# (a real bug that should be investigated).
+#
+# Now: expected misses (empty result) still fall back silently; real
+# errors are logged at WARNING level with context. Caller gets the
+# same float back either way, so no API change.
 
 def get_payer_denial_rate(
     payer_id: str,
@@ -292,30 +296,63 @@ def get_payer_denial_rate(
     """
     Look up the best available denial rate for a payer.
     Priority: PAYER_DISCLOSURE > CMS_PUF > KFF
-    Falls back to national average (0.077) if not found.
+    Falls back to national average if not found or on DB error.
     """
+    owns_conn = False
     if conn is None:
         try:
             conn = sqlite3.connect(str(DB_PATH))
-        except Exception:
-            return 0.077
+            owns_conn = True
+        except Exception as e:
+            logger.warning(
+                "Could not open base_rates DB at %s: %s. "
+                "Falling back to national average denial rate.",
+                DB_PATH, e,
+            )
+            return _NATIONAL_AVG_DENIAL_RATE
 
-    row = conn.execute(
-        """SELECT denial_rate FROM payer_denial_rates
-           WHERE payer_id = ?
-           ORDER BY
-             CASE source
-               WHEN 'PAYER_DISCLOSURE' THEN 1
-               WHEN 'CMS_PUF' THEN 2
-               WHEN 'KFF' THEN 3
-               ELSE 4
-             END,
-             year DESC
-           LIMIT 1""",
-        (payer_id.upper(),),
-    ).fetchone()
+    try:
+        row = conn.execute(
+            """SELECT denial_rate FROM payer_denial_rates
+               WHERE payer_id = ?
+               ORDER BY
+                 CASE source
+                   WHEN 'PAYER_DISCLOSURE' THEN 1
+                   WHEN 'CMS_PUF' THEN 2
+                   WHEN 'KFF' THEN 3
+                   ELSE 4
+                 END,
+                 year DESC
+               LIMIT 1""",
+            (payer_id.upper(),),
+        ).fetchone()
+    except sqlite3.OperationalError as e:
+        # Table missing or DB schema wrong — this is a real bug, log it.
+        logger.warning(
+            "DB query failed for payer_denial_rates (payer_id=%r): %s. "
+            "Did you run `python setup_data.py seed`? "
+            "Falling back to national average.",
+            payer_id, e,
+        )
+        return _NATIONAL_AVG_DENIAL_RATE
+    except Exception as e:
+        logger.warning(
+            "Unexpected error querying payer_denial_rates for %r: %s. "
+            "Falling back to national average.",
+            payer_id, e,
+        )
+        return _NATIONAL_AVG_DENIAL_RATE
+    finally:
+        if owns_conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
-    return row[0] if row else 0.077
+    if row is None:
+        # Expected miss — payer not in DB. No warning, just fall back.
+        return _NATIONAL_AVG_DENIAL_RATE
+    return row[0]
 
 
 def get_procedure_approval_rate(
@@ -323,20 +360,51 @@ def get_procedure_approval_rate(
     conn: sqlite3.Connection | None = None,
 ) -> float:
     """Look up procedure-category approval rate. Falls back to 0.85."""
+    owns_conn = False
     if conn is None:
         try:
             conn = sqlite3.connect(str(DB_PATH))
-        except Exception:
-            return 0.85
+            owns_conn = True
+        except Exception as e:
+            logger.warning(
+                "Could not open base_rates DB at %s: %s. "
+                "Falling back to national average approval rate.",
+                DB_PATH, e,
+            )
+            return _NATIONAL_AVG_APPROVAL_RATE
 
-    row = conn.execute(
-        """SELECT approval_rate FROM procedure_approval_rates
-           WHERE procedure_category = ?
-           ORDER BY year DESC LIMIT 1""",
-        (procedure_category.upper(),),
-    ).fetchone()
+    try:
+        row = conn.execute(
+            """SELECT approval_rate FROM procedure_approval_rates
+               WHERE procedure_category = ?
+               ORDER BY year DESC LIMIT 1""",
+            (procedure_category.upper(),),
+        ).fetchone()
+    except sqlite3.OperationalError as e:
+        logger.warning(
+            "DB query failed for procedure_approval_rates "
+            "(category=%r): %s. Did you run `python setup_data.py seed`? "
+            "Falling back to national average.",
+            procedure_category, e,
+        )
+        return _NATIONAL_AVG_APPROVAL_RATE
+    except Exception as e:
+        logger.warning(
+            "Unexpected error querying procedure_approval_rates for %r: %s. "
+            "Falling back to national average.",
+            procedure_category, e,
+        )
+        return _NATIONAL_AVG_APPROVAL_RATE
+    finally:
+        if owns_conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
-    return row[0] if row else 0.85
+    if row is None:
+        return _NATIONAL_AVG_APPROVAL_RATE
+    return row[0]
 
 
 # ── Connecticut / Vermont state data loader ────────────────────────────────
@@ -349,16 +417,6 @@ def load_state_insurer_report(
 ) -> int:
     """
     Load state insurance department PA data (CT or VT report card format).
-
-    Connecticut publishes annual insurer report cards since 2011.
-    Vermont publishes PA data for insurers covering 2,000+ residents.
-
-    Expected CSV columns: insurer_name, total_claims, denied_claims,
-    denial_rate, appeals, appeals_overturned
-
-    Download from:
-      CT: portal.ct.gov/cid (Health Insurance section)
-      VT: dfr.vermont.gov (Health Insurance section)
     """
     if conn is None:
         conn = init_base_rate_db()
@@ -374,7 +432,7 @@ def load_state_insurer_report(
             payer_id = _normalize_payer_name(name)
             denial_rate = _safe_float(row.get("denial_rate", "0"))
             if denial_rate > 1:
-                denial_rate /= 100.0  # handle percentage format
+                denial_rate /= 100.0
 
             conn.execute(
                 """INSERT OR REPLACE INTO payer_denial_rates
@@ -400,7 +458,6 @@ def load_state_insurer_report(
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 def _normalize_payer_name(name: str) -> str:
-    """Map insurer names to canonical payer IDs."""
     upper = name.upper()
     if "UNITED" in upper or "UHC" in upper:
         return "UHC"

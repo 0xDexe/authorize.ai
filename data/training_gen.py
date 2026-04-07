@@ -22,7 +22,7 @@ from .public_rates import (
     get_payer_denial_rate, get_procedure_approval_rate,
     init_base_rate_db, seed_kff_base_rates,
 )
-from ..models.features import (
+from src.models.features import (
     FeatureVector, CPT_TO_CATEGORY,
     PAYER_DENIAL_RATES, PROCEDURE_CATEGORY_APPROVAL_RATES,
 )
@@ -174,8 +174,8 @@ def _agent_features_and_label(
     Run Agents 1+2 on the case to get real extraction + matching features.
     More accurate but requires LLM API calls (costs ~$0.01-0.05 per case).
     """
-    from ..models.features import extract_features
-    from ..state import AuthorizeState
+    from src.models.features import extract_features
+    from src.state import AuthorizeState
 
     try:
         inputs = case_to_pipeline_input(case)

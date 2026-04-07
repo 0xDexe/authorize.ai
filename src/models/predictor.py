@@ -21,7 +21,7 @@ try:
 except ImportError:
     HAS_SKLEARN = False
 
-from .features_updated import FeatureVector, extract_features
+from .features import FeatureVector, extract_features
 from ..state import AuthorizeState, PredictionResult
 
 MODEL_DIR = Path(__file__).resolve().parents[2] / "data" / "models"

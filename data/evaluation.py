@@ -207,15 +207,15 @@ def summarize_eval_results(results: list[PipelineEvalResult]) -> dict:
         return {"n_cases": 0}
 
     successful = [r for r in results if r.pipeline_status == "success"]
-    with_extraction = [r for r in successful if r.extraction_eval]
+    with_extraction = [r for r in successful if r.extraction_eval is not None]
 
     avg_dx_f1 = 0.0
     avg_drug_recall = 0.0
     avg_confidence = 0.0
     if with_extraction:
-        avg_dx_f1 = sum(r.extraction_eval.dx_f1 for r in with_extraction) / len(with_extraction)
-        avg_drug_recall = sum(r.extraction_eval.drug_recall for r in with_extraction) / len(with_extraction)
-        avg_confidence = sum(r.extraction_eval.extraction_confidence for r in with_extraction) / len(with_extraction)
+        avg_dx_f1 = sum(e.dx_f1 for r in with_extraction if (e := r.extraction_eval) is not None) / len(with_extraction)
+        avg_drug_recall = sum(e.drug_recall for r in with_extraction if (e := r.extraction_eval) is not None) / len(with_extraction)
+        avg_confidence = sum(e.extraction_confidence for r in with_extraction if (e := r.extraction_eval) is not None) / len(with_extraction)
 
     return {
         "n_cases": n,
