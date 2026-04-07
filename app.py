@@ -14,7 +14,7 @@ from src.state import PipelineStatus, CriterionStatus
 from src.retrieval.indexer import init_db, bulk_index_from_directory
 from src.models.predictor import ApprovalPredictor, generate_synthetic_training_data
 from src.utils.pdf_parser import extract_text
-from src.config import config
+from config import config
 
 
 # ── Page config ──
