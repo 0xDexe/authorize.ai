@@ -33,6 +33,8 @@ from data.evaluation import (
 from src.models.predictor import ApprovalPredictor
 from src.models.features import FeatureVector
 
+from dotenv import load_dotenv
+load_dotenv()
 
 def cmd_validate(args):
     """Check MIMIC-IV directory structure."""

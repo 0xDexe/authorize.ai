@@ -645,34 +645,30 @@ def filter_cases_with_imaging(cases: list[MIMICCase]) -> list[MIMICCase]:
 
 def case_to_pipeline_input(
     case: MIMICCase,
-    procedure_code: str = "",
-) -> dict:
-    """
-    Convert a MIMICCase into kwargs for run_pipeline().
-
-    WARNING (loophole #4): MIMIC discharge summaries are retrospective
-    end-of-stay narratives, not prospective PA request documentation.
-    This function emits a one-shot UserWarning on first call to make
-    sure callers know what they're feeding into Agent 1.
-
-    CPT selection (loophole #3): if no procedure_code is explicitly
-    provided, the first CPT from radiology_cpt_codes is used. That list
-    is now deduped + sorted, so the choice is deterministic across runs.
-    Fallback is CPT 72148 (MRI lumbar) if the case has no radiology.
-    """
+    procedure_code: str = "") -> dict:
     _warn_retrospective_once()
 
     if not procedure_code:
-        cpts = case.radiology_cpt_codes  # already sorted + deduped
+        cpts = case.radiology_cpt_codes
         procedure_code = cpts[0] if cpts else "72148"
+
+    # Map proxy payer IDs to real payer IDs that exist in the policy index
+    payer_map = {
+        "CMS_MEDICARE_PROXY": "UHC",
+        "CMS_MEDICAID_PROXY": "CENTENE",
+        "COMMERCIAL_GENERIC_PROXY": "AETNA",
+        "SELF_PAY_PROXY": "UHC",
+        "GOVERNMENT_OTHER_PROXY": "HUMANA",
+        "UNKNOWN_PROXY": "UHC",
+    }
+    payer_id = payer_map.get(case.payer_proxy, "UHC")
 
     return {
         "clinical_text": case.primary_discharge_text,
-        "payer_id": case.payer_proxy,
+        "payer_id": payer_id,
         "procedure_code": procedure_code,
         "patient_id": case.subject_id,
     }
-
 
 def case_to_ground_truth(case: MIMICCase) -> dict:
     return {

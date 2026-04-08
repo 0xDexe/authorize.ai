@@ -10,6 +10,7 @@ Pipeline flow:
 """
 
 from langgraph.graph import StateGraph, START, END
+from sklearn import pipeline
 
 from .state import AuthorizeState, PipelineStatus
 from .agents.extraction import extraction_agent
@@ -128,4 +129,6 @@ def run_pipeline(
     )
 
     final_state = pipeline.invoke(initial_state)
+    if isinstance(final_state, dict):
+        final_state = AuthorizeState(**final_state)
     return final_state

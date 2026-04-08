@@ -49,6 +49,15 @@ class PipelineEvalResult:
     elapsed_seconds: float = 0.0
 
 
+def _icd_prefix_match(code_a: str, code_b: str) -> bool:
+    """
+    Check if two ICD codes match via prefix matching.
+    Handles cases where extracted code may be shorter (M54 vs M544)
+    or longer (M5416 vs M54) than the true code.
+    """
+    return code_a.startswith(code_b) or code_b.startswith(code_a)
+
+
 def evaluate_extraction(
     case: MIMICCase,
     extracted_state: dict,
@@ -71,18 +80,31 @@ def evaluate_extraction(
     result.extracted_dx_codes = list(extracted_codes)
 
     if extracted_codes and true_codes:
-        # Prefix match: extracted M54 matches true M54.4
-        matches = sum(
+        # Precision: what fraction of extracted codes match a true code
+        precision_matches = sum(
             1 for ec in extracted_codes
-            if any(tc.startswith(ec) or ec.startswith(tc) for tc in true_codes)
+            if any(_icd_prefix_match(ec, tc) for tc in true_codes)
         )
-        result.dx_precision = matches / len(extracted_codes) if extracted_codes else 0
-        result.dx_recall = matches / len(true_codes) if true_codes else 0
+        # Recall: what fraction of true codes are matched by an extracted code
+        recall_matches = sum(
+            1 for tc in true_codes
+            if any(_icd_prefix_match(ec, tc) for ec in extracted_codes)
+        )
+        result.dx_precision = precision_matches / len(extracted_codes)
+        result.dx_recall = recall_matches / len(true_codes)
         if result.dx_precision + result.dx_recall > 0:
             result.dx_f1 = (
                 2 * result.dx_precision * result.dx_recall
                 / (result.dx_precision + result.dx_recall)
             )
+    elif extracted_codes and not true_codes:
+        # No ground truth codes — can't compute meaningful metrics
+        result.dx_precision = 0.0
+        result.dx_recall = 0.0
+    elif true_codes and not extracted_codes:
+        # Extraction found nothing — zero recall
+        result.dx_precision = 0.0
+        result.dx_recall = 0.0
 
     # ── Drug matching ──
     true_drugs = set(d.lower() for d in ground["drugs"])
@@ -101,9 +123,10 @@ def evaluate_extraction(
     result.extracted_drugs = list(extracted_drugs)
 
     if true_drugs:
+        # Count true drugs that are matched by any extracted drug
         drug_matches = sum(
-            1 for ed in extracted_drugs
-            if any(ed in td or td in ed for td in true_drugs)
+            1 for td in true_drugs
+            if any(ed in td or td in ed for ed in extracted_drugs)
         )
         result.drug_recall = drug_matches / len(true_drugs)
 
@@ -210,18 +233,39 @@ def summarize_eval_results(results: list[PipelineEvalResult]) -> dict:
     with_extraction = [r for r in successful if r.extraction_eval is not None]
 
     avg_dx_f1 = 0.0
+    avg_dx_precision = 0.0
+    avg_dx_recall = 0.0
     avg_drug_recall = 0.0
     avg_confidence = 0.0
     if with_extraction:
-        avg_dx_f1 = sum(e.dx_f1 for r in with_extraction if (e := r.extraction_eval) is not None) / len(with_extraction)
-        avg_drug_recall = sum(e.drug_recall for r in with_extraction if (e := r.extraction_eval) is not None) / len(with_extraction)
-        avg_confidence = sum(e.extraction_confidence for r in with_extraction if (e := r.extraction_eval) is not None) / len(with_extraction)
+        avg_dx_f1 = sum(
+            r.extraction_eval.dx_f1 for r in with_extraction
+            if r.extraction_eval is not None
+        ) / len(with_extraction)
+        avg_dx_precision = sum(
+            r.extraction_eval.dx_precision for r in with_extraction
+            if r.extraction_eval is not None
+        ) / len(with_extraction)
+        avg_dx_recall = sum(
+            r.extraction_eval.dx_recall for r in with_extraction
+            if r.extraction_eval is not None
+        ) / len(with_extraction)
+        avg_drug_recall = sum(
+            r.extraction_eval.drug_recall for r in with_extraction
+            if r.extraction_eval is not None
+        ) / len(with_extraction)
+        avg_confidence = sum(
+            r.extraction_eval.extraction_confidence for r in with_extraction
+            if r.extraction_eval is not None
+        ) / len(with_extraction)
 
     return {
         "n_cases": n,
         "n_successful": len(successful),
         "n_failed": n - len(successful),
         "success_rate": round(len(successful) / n, 3),
+        "avg_dx_precision": round(avg_dx_precision, 3),
+        "avg_dx_recall": round(avg_dx_recall, 3),
         "avg_dx_f1": round(avg_dx_f1, 3),
         "avg_drug_recall": round(avg_drug_recall, 3),
         "avg_extraction_confidence": round(avg_confidence, 3),
