@@ -48,3 +48,4 @@ Thumbs.db
 data/mimic-iv/hosp/
 data/mimic-iv/note/
 data/policies/
+data/policy_index.db
