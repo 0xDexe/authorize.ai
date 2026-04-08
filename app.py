@@ -15,7 +15,8 @@ from src.retrieval.indexer import init_db, bulk_index_from_directory
 from src.models.predictor import ApprovalPredictor, generate_synthetic_training_data
 from src.utils.pdf_parser import extract_text
 from config import config
-
+from dotenv import load_dotenv
+load_dotenv()
 
 # ── Page config ──
 st.set_page_config(
@@ -126,6 +127,11 @@ with tab_results:
                 procedure_code=procedure_code,
                 letter_type=letter_type,
             )
+
+# Convert dict to AuthorizeState if needed
+            if isinstance(result, dict):
+                from src.state import AuthorizeState
+                result = AuthorizeState(**result)
 
             elapsed = time.time() - start
             progress.progress(100, text=f"Complete in {elapsed:.1f}s")

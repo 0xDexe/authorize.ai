@@ -6,6 +6,7 @@ criterion chunks for a given procedure code, payer, and clinical keywords.
 """
 
 import json
+import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,7 +53,9 @@ def search_policies(
     if clinical_keywords:
         query_parts.extend(clinical_keywords[:10])  # cap keyword count
 
-    fts_query = " OR ".join(query_parts)
+# Remove special characters that break FTS5 syntax
+    clean_parts = [re.sub(r'[^\w\s]', '', p) for p in query_parts if p.strip()]
+    fts_query = " OR ".join(p for p in clean_parts if p.strip())
 
     sql = """
         SELECT

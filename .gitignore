@@ -44,3 +44,7 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+data/mimic-iv/hosp/
+data/mimic-iv/note/
+data/policies/
