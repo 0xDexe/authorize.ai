@@ -1,0 +1,13 @@
+services:
+  authorize-ai:
+    build: .
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    volumes:
+      # Persists the policy index, trained models, and databases across restarts.
+      # Put approval_model.pkl in ./data/models/ before building, or set
+      # APPROVAL_MODEL_PATH in .env to an absolute path inside this volume.
+      - ./data:/app/data
+    restart: unless-stopped

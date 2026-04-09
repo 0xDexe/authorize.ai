@@ -46,6 +46,19 @@ def call_llm(
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
+            elif provider == "ollama":
+                raw = _call_ollama(
+                    system_prompt, user_prompt,
+                    model=model or os.getenv("OLLAMA_MODEL", "llama3.2"),
+                    temperature=temperature,
+                )
+            elif provider == "cloudflare":
+                raw = _call_cloudflare(
+                    system_prompt, user_prompt,
+                    model=model or os.getenv("CLOUDFLARE_MODEL", "@cf/meta/llama-3.1-8b-instruct"),
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
             else:
                 raise ValueError(f"Unsupported LLM provider: {provider}")
 
@@ -71,9 +84,10 @@ def _resolve_provider(explicit: str | None) -> str:
         return "anthropic"
     if os.getenv("OPENAI_API_KEY"):
         return "openai"
-    raise EnvironmentError(
-        "No LLM provider configured. Set ANTHROPIC_API_KEY or OPENAI_API_KEY."
-    )
+    if os.getenv("CLOUDFLARE_API_TOKEN"):
+        return "cloudflare"
+    # Fall back to Ollama (local or remote via OLLAMA_HOST)
+    return "ollama"
 
 
 def _call_anthropic(
@@ -106,6 +120,65 @@ def _call_openai(
         raise ImportError("pip install openai")
 
     client = OpenAI()
+    response = client.chat.completions.create(
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    )
+    return response.choices[0].message.content
+
+
+def _call_ollama(
+    system: str, user: str, model: str, temperature: float,
+) -> str:
+    try:
+        import ollama
+    except ImportError:
+        raise ImportError(
+            "pip install ollama  (also install Ollama from https://ollama.com)"
+        )
+
+    # OLLAMA_HOST allows pointing to a remote Ollama server
+    # e.g. OLLAMA_HOST=http://192.168.1.100:11434
+    host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+    client = ollama.Client(host=host)
+
+    response = client.chat(
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        options={"temperature": temperature},
+    )
+    return response["message"]["content"]
+
+
+def _call_cloudflare(
+    system: str, user: str, model: str,
+    temperature: float, max_tokens: int,
+) -> str:
+    try:
+        from openai import OpenAI
+    except ImportError:
+        raise ImportError("pip install openai")
+
+    account_id = os.getenv("CLOUDFLARE_ACCOUNT_ID")
+    api_token = os.getenv("CLOUDFLARE_API_TOKEN")
+
+    if not account_id or not api_token:
+        raise EnvironmentError(
+            "Set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN in .env"
+        )
+
+    client = OpenAI(
+        api_key=api_token,
+        base_url=f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1",
+    )
     response = client.chat.completions.create(
         model=model,
         temperature=temperature,

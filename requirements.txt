@@ -1,13 +1,14 @@
 # ── Core Framework ──
 langgraph>=0.2.0
 langchain-core>=0.3.0
+langsmith>=0.1.0
 
-# ── LLM Providers (install one or both) ──
+# ── LLM Providers ──
 anthropic>=0.39.0
-# openai>=1.50.0
+openai>=1.50.0
 
 # ── ML / Data ──
-scikit-learn>=1.4.0
+scikit-learn==1.8.0
 numpy>=1.26.0
 
 # ── Document Processing ──
@@ -15,6 +16,12 @@ PyMuPDF>=1.24.0
 
 # ── Demo UI ──
 streamlit>=1.38.0
+
+# ── Local LLM (optional — install Ollama from https://ollama.com) ──
+# ollama>=0.3.0
+
+# ── Observability (optional — use one or both) ──
+langfuse>=2.0.0
 
 # ── Optional: dev/test ──
 pytest>=8.0.0

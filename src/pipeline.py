@@ -9,14 +9,33 @@ Pipeline flow:
                   ↘ (if failed/needs_review) → END
 """
 
+import os
+
 from langgraph.graph import StateGraph, START, END
-from sklearn import pipeline
 
 from .state import AuthorizeState, PipelineStatus
 from .agents.extraction import extraction_agent
 from .agents.matching import matching_agent
 from .agents.prediction import prediction_agent
 from .agents.drafting import drafting_agent
+
+
+def _get_callbacks() -> list:
+    """Return tracing callbacks based on available configuration."""
+    callbacks = []
+
+    # LangSmith — enabled via LANGCHAIN_TRACING_V2=true (picked up automatically
+    # by LangGraph; no explicit callback needed)
+
+    # Langfuse — enabled when LANGFUSE_PUBLIC_KEY is set
+    if os.getenv("LANGFUSE_PUBLIC_KEY"):
+        try:
+            from langfuse.callback import CallbackHandler
+            callbacks.append(CallbackHandler())
+        except ImportError:
+            pass  # langfuse not installed — skip silently
+
+    return callbacks
 
 
 # ── Conditional edge functions ──────────────────────────────────────────
@@ -104,6 +123,8 @@ def run_pipeline(
     procedure_code: str,
     patient_id: str = "",
     letter_type: str = "initial",
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
 ) -> AuthorizeState:
     """
     Convenience function to run the full pipeline end-to-end.
@@ -118,6 +139,17 @@ def run_pipeline(
     Returns:
         Completed AuthorizeState with all agent outputs populated.
     """
+    # Override provider/model for this invocation if specified
+    if llm_provider:
+        os.environ["AUTHORIZEAI_LLM_PROVIDER"] = llm_provider
+    if llm_model:
+        _model_env = {
+            "anthropic": "ANTHROPIC_MODEL",
+            "openai": "OPENAI_MODEL",
+            "ollama": "OLLAMA_MODEL",
+        }.get(llm_provider or os.getenv("AUTHORIZEAI_LLM_PROVIDER", ""), "ANTHROPIC_MODEL")
+        os.environ[_model_env] = llm_model
+
     pipeline = build_pipeline()
 
     initial_state = AuthorizeState(
@@ -128,7 +160,10 @@ def run_pipeline(
         letter_type=letter_type,
     )
 
-    final_state = pipeline.invoke(initial_state)
+    callbacks = _get_callbacks()
+    config = {"callbacks": callbacks} if callbacks else {}
+
+    final_state = pipeline.invoke(initial_state, config=config)
     if isinstance(final_state, dict):
         final_state = AuthorizeState(**final_state)
     return final_state

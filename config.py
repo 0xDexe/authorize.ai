@@ -31,6 +31,12 @@ class Config:
 
     # Prediction model
     prediction_model_type: str = os.getenv("PREDICTION_MODEL", "logistic")
+    approval_model_path: str = os.getenv("APPROVAL_MODEL_PATH", "")
+
+    # LangSmith tracing (auto-picked up by LangGraph via env vars; listed here for visibility)
+    langchain_tracing_v2: str = os.getenv("LANGCHAIN_TRACING_V2", "false")
+    langchain_api_key: str = os.getenv("LANGCHAIN_API_KEY", "")
+    langchain_project: str = os.getenv("LANGCHAIN_PROJECT", "authorize-ai")
 
     def validate(self) -> list[str]:
         """Check for missing required config. Returns list of issues."""

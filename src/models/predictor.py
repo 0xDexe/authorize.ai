@@ -7,6 +7,7 @@ data generation for the hackathon prototype.
 """
 
 import json
+import os
 import pickle
 from pathlib import Path
 
@@ -27,6 +28,21 @@ from ..state import AuthorizeState, PredictionResult
 MODEL_DIR = Path(__file__).resolve().parents[2] / "data" / "models"
 
 
+def _resolve_model_path(override: Path | None) -> Path:
+    """
+    Resolve the model path in priority order:
+      1. Explicit override argument
+      2. APPROVAL_MODEL_PATH env var
+      3. Default data/models/approval_model.pkl
+    """
+    if override is not None:
+        return override
+    env_path = os.environ.get("APPROVAL_MODEL_PATH", "").strip()
+    if env_path:
+        return Path(env_path)
+    return MODEL_DIR / "approval_model.pkl"
+
+
 class ApprovalPredictor:
     """
     Wraps a scikit-learn classifier for PA approval prediction.
@@ -37,7 +53,7 @@ class ApprovalPredictor:
     def __init__(self, model_path: Path | None = None):
         self.model = None
         self.scaler = None
-        self.model_path = model_path or (MODEL_DIR / "approval_model.pkl")
+        self.model_path = _resolve_model_path(model_path)
 
         if self.model_path.exists():
             self._load_model()
@@ -45,8 +61,13 @@ class ApprovalPredictor:
     def _load_model(self) -> None:
         with open(self.model_path, "rb") as f:
             bundle = pickle.load(f)
+        # Support both a plain model object and a {"model": ..., "scaler": ...} bundle
+        if isinstance(bundle, dict):
             self.model = bundle["model"]
             self.scaler = bundle.get("scaler")
+        else:
+            self.model = bundle
+            self.scaler = None
 
     def _save_model(self) -> None:
         self.model_path.parent.mkdir(parents=True, exist_ok=True)
@@ -70,7 +91,6 @@ class ApprovalPredictor:
         X = np.array([features.to_list()])
         if self.scaler:
             X = self.scaler.transform(X)
-
         prob = self.model.predict_proba(X)[0][1]  # P(approved)
 
         # Identify top contributing factors via feature importance

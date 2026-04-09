@@ -52,6 +52,43 @@ with st.sidebar:
 
     st.divider()
 
+    st.subheader("Model")
+
+    PROVIDER_MODELS = {
+        "Anthropic (Claude)": {
+            "provider": "anthropic",
+            "models": [
+                "claude-sonnet-4-20250514",
+                "claude-opus-4-20250514",
+                "claude-haiku-4-5-20251001",
+            ],
+        },
+        "OpenAI": {
+            "provider": "openai",
+            "models": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo"],
+        },
+        "Cloudflare Workers AI (free)": {
+            "provider": "cloudflare",
+            "models": [
+                "@cf/meta/llama-3.1-8b-instruct",
+                "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+                "@cf/mistral/mistral-7b-instruct-v0.2",
+                "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
+            ],
+        },
+        "Ollama (local / self-hosted)": {
+            "provider": "ollama",
+            "models": ["llama3.2", "llama3.1", "mistral", "phi3", "deepseek-r1:7b", "deepseek-r1:14b"],
+        },
+    }
+
+    provider_label = st.selectbox("Provider", list(PROVIDER_MODELS.keys()))
+    provider_info = PROVIDER_MODELS[provider_label]
+    llm_provider = provider_info["provider"]
+    llm_model = st.selectbox("Model", provider_info["models"])
+
+    st.divider()
+
     # Admin tools
     with st.expander("🔧 Admin Tools"):
         if st.button("Index Policy Documents"):
@@ -112,112 +149,113 @@ with tab_input:
         disabled=not clinical_text,
     )
 
-with tab_results:
     if run_button and clinical_text:
         progress = st.progress(0, text="Starting pipeline...")
-
         try:
-            # Run the pipeline
             progress.progress(10, text="Agent 1: Extracting clinical data...")
             start = time.time()
-
             result = run_pipeline(
                 clinical_text=clinical_text,
                 payer_id=payer_id,
                 procedure_code=procedure_code,
                 letter_type=letter_type,
+                llm_provider=llm_provider,
+                llm_model=llm_model,
             )
-
-# Convert dict to AuthorizeState if needed
             if isinstance(result, dict):
                 from src.state import AuthorizeState
                 result = AuthorizeState(**result)
-
-            elapsed = time.time() - start
-            progress.progress(100, text=f"Complete in {elapsed:.1f}s")
-
-            # Status banner
-            if result.status == PipelineStatus.SUCCESS:
-                st.success(f"Pipeline completed successfully in {elapsed:.1f}s")
-            elif result.status == PipelineStatus.NEEDS_REVIEW:
-                st.warning("Pipeline completed with review flags")
-            else:
-                st.error("Pipeline encountered errors")
-
-            if result.errors:
-                with st.expander("⚠️ Errors & Warnings"):
-                    for err in result.errors:
-                        st.warning(err)
-
-            # ── Results display ──
-            col1, col2, col3 = st.columns(3)
-
-            with col1:
-                st.metric(
-                    "Approval Probability",
-                    f"{result.prediction.approval_probability:.0%}",
-                )
-
-            with col2:
-                st.metric(
-                    "Coverage Score",
-                    f"{result.overall_coverage_score:.0%}",
-                )
-
-            with col3:
-                risk_colors = {"low": "🟢", "medium": "🟡", "high": "🔴"}
-                tier = result.prediction.risk_tier
-                st.metric(
-                    "Risk Tier",
-                    f"{risk_colors.get(tier, '⚪')} {tier.upper()}",
-                )
-
-            # Criteria breakdown
-            st.subheader("Coverage Criteria Evaluation")
-            if result.criteria_results:
-                for cr in result.criteria_results:
-                    icon = {
-                        CriterionStatus.MET: "✅",
-                        CriterionStatus.NOT_MET: "❌",
-                        CriterionStatus.INSUFFICIENT: "❓",
-                    }.get(cr.status, "❓")
-
-                    with st.expander(
-                        f"{icon} {cr.criterion_id}: {cr.criterion_text[:80]}"
-                    ):
-                        st.write(f"**Status:** {cr.status.value}")
-                        st.write(f"**Evidence:** {cr.evidence}")
-                        st.write(f"**Confidence:** {cr.confidence:.0%}")
-
-            # Gaps
-            if result.gaps:
-                st.subheader("Documentation Gaps")
-                for gap in result.gaps:
-                    st.write(f"• {gap}")
-
-            # Recommended actions
-            if result.prediction.recommended_actions:
-                st.subheader("Recommended Actions")
-                for action in result.prediction.recommended_actions:
-                    st.info(action)
-
-            # Draft letter
-            st.subheader("Draft PA Letter")
-            st.text_area(
-                "Generated Letter (editable)",
-                value=result.draft_letter,
-                height=400,
-            )
-
-            # Raw JSON output
-            with st.expander("🔍 Full Pipeline Output (JSON)"):
-                from dataclasses import asdict
-                st.json(json.loads(json.dumps(asdict(result), default=str)))
-
+            st.session_state["pipeline_result"] = result
+            st.session_state["pipeline_elapsed"] = time.time() - start
+            progress.progress(100, text="Done — check the Results tab")
+            st.success("Done! Click the **📊 Results** tab to see output.")
         except Exception as e:
             progress.progress(100, text="Failed")
             st.error(f"Pipeline error: {str(e)}")
             st.exception(e)
 
-    elif not clinical_text:
+with tab_results:
+    result = st.session_state.get("pipeline_result")
+    elapsed = st.session_state.get("pipeline_elapsed", 0)
+
+    if result:
+        # Status banner
+        if result.status == PipelineStatus.SUCCESS:
+            st.success(f"Pipeline completed successfully in {elapsed:.1f}s")
+        elif result.status == PipelineStatus.NEEDS_REVIEW:
+            st.warning("Pipeline completed with review flags")
+        else:
+            st.error("Pipeline encountered errors")
+
+        if result.errors:
+            with st.expander("⚠️ Errors & Warnings"):
+                for err in result.errors:
+                    st.warning(err)
+
+        # ── Results display ──
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            st.metric(
+                "Approval Probability",
+                f"{result.prediction.approval_probability:.0%}",
+            )
+
+        with col2:
+            st.metric(
+                "Coverage Score",
+                f"{result.overall_coverage_score:.0%}",
+            )
+
+        with col3:
+            risk_colors = {"low": "🟢", "medium": "🟡", "high": "🔴"}
+            tier = result.prediction.risk_tier
+            st.metric(
+                "Risk Tier",
+                f"{risk_colors.get(tier, '⚪')} {tier.upper()}",
+            )
+
+        # Criteria breakdown
+        st.subheader("Coverage Criteria Evaluation")
+        if result.criteria_results:
+            for cr in result.criteria_results:
+                icon = {
+                    CriterionStatus.MET: "✅",
+                    CriterionStatus.NOT_MET: "❌",
+                    CriterionStatus.INSUFFICIENT: "❓",
+                }.get(cr.status, "❓")
+
+                with st.expander(
+                    f"{icon} {cr.criterion_id}: {cr.criterion_text[:80]}"
+                ):
+                    st.write(f"**Status:** {cr.status.value}")
+                    st.write(f"**Evidence:** {cr.evidence}")
+                    st.write(f"**Confidence:** {cr.confidence:.0%}")
+
+        # Gaps
+        if result.gaps:
+            st.subheader("Documentation Gaps")
+            for gap in result.gaps:
+                st.write(f"• {gap}")
+
+        # Recommended actions
+        if result.prediction.recommended_actions:
+            st.subheader("Recommended Actions")
+            for action in result.prediction.recommended_actions:
+                st.info(action)
+
+        # Draft letter
+        st.subheader("Draft PA Letter")
+        st.text_area(
+            "Generated Letter (editable)",
+            value=result.draft_letter,
+            height=400,
+        )
+
+        # Raw JSON output
+        with st.expander("🔍 Full Pipeline Output (JSON)"):
+            from dataclasses import asdict
+            st.json(json.loads(json.dumps(asdict(result), default=str)))
+
+    else:
         st.info("Paste or upload clinical notes in the Input tab, then run the pipeline.")
