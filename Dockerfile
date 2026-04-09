@@ -17,11 +17,11 @@ COPY . .
 # If a pre-trained model is bundled in the repo, it will already be at data/models/.
 # Alternatively mount it via docker-compose volumes (see docker-compose.yml).
 
-EXPOSE 8501
+EXPOSE $PORT
 
-HEALTHCHECK CMD curl --fail http://localhost:8501/_stcore/health || exit 1
+HEALTHCHECK CMD curl --fail http://localhost:$PORT/_stcore/health || exit 1
 
-CMD ["streamlit", "run", "app.py", \
-     "--server.port=8501", \
-     "--server.address=0.0.0.0", \
-     "--server.headless=true"]
+CMD streamlit run app.py \
+    --server.port=$PORT \
+    --server.address=0.0.0.0 \
+    --server.headless=true
